@@ -1,0 +1,15 @@
+[Unit]
+Description=Sage Admin Panel
+After=network.target
+
+[Service]
+Type=simple
+User=dennis-admin
+WorkingDirectory=/home/dennis-admin/sage-agent
+Environment=PATH=/home/dennis-admin/sage-agent/venv/bin:/usr/bin
+ExecStart=/home/dennis-admin/sage-agent/venv/bin/uvicorn admin.app:app --host 0.0.0.0 --port 5000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

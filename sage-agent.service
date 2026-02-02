@@ -1,0 +1,15 @@
+[Unit]
+Description=Sage Voice Assistant Agent
+After=network.target
+
+[Service]
+Type=simple
+User=dennis-admin
+WorkingDirectory=/home/dennis-admin/sage-agent
+Environment=PATH=/home/dennis-admin/sage-agent/venv/bin:/usr/bin
+ExecStart=/home/dennis-admin/sage-agent/venv/bin/python agent.py start
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
