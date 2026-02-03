@@ -1,13 +1,15 @@
 """
-Sage Voice Assistant Agent v4.3
+Sage Voice Assistant Agent v4.4
 Manual action parsing via tts_node interception
 Actions are parsed and executed BEFORE text reaches TTS
 - Multi-pattern regex for LLM output variations
 - Startup validation for required config
+- Dynamic device loading from exposed_devices.json
 """
 
 import os
 import re
+import json
 import logging
 import asyncio
 import aiohttp
@@ -29,6 +31,23 @@ HA_TOKEN = os.environ.get("HOME_ASSISTANT_TOKEN", "")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 PROMPT_FILE = Path(__file__).parent / "system_prompt.txt"
+EXPOSED_DEVICES_FILE = Path(__file__).parent / "exposed_devices.json"
+
+# Domain labels for prompt generation
+DOMAIN_LABELS = {
+    "automation": "AUTOMATIONS",
+    "light": "LIGHTS",
+    "switch": "SWITCHES",
+    "button": "BUTTONS",
+    "scene": "SCENES",
+    "script": "SCRIPTS",
+    "lock": "LOCKS",
+    "cover": "COVERS",
+    "fan": "FANS",
+    "climate": "CLIMATE",
+    "media_player": "MEDIA PLAYERS",
+    "input_boolean": "INPUT BOOLEANS",
+}
 
 
 def validate_config() -> bool:
@@ -64,6 +83,116 @@ def validate_config() -> bool:
 
     logger.info("Configuration validated successfully")
     return True
+
+
+def load_exposed_devices() -> list:
+    """Load list of exposed device entity_ids from config file."""
+    if EXPOSED_DEVICES_FILE.exists():
+        try:
+            devices = json.loads(EXPOSED_DEVICES_FILE.read_text())
+            logger.info(f"Loaded {len(devices)} exposed devices from config")
+            return devices
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse exposed_devices.json: {e}")
+            return []
+    logger.info("No exposed_devices.json found, using empty device list")
+    return []
+
+
+async def fetch_device_details(entity_ids: list) -> dict:
+    """Fetch device details from Home Assistant for the given entity_ids.
+
+    Returns a dict mapping entity_id to {friendly_name, state, domain}.
+    """
+    if not HA_TOKEN or not entity_ids:
+        return {}
+
+    details = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {HA_TOKEN}"}
+            async with session.get(f"{HA_URL}/api/states", headers=headers) as resp:
+                if resp.status == 200:
+                    states = await resp.json()
+                    for entity in states:
+                        entity_id = entity.get("entity_id", "")
+                        if entity_id in entity_ids:
+                            details[entity_id] = {
+                                "friendly_name": entity.get("attributes", {}).get("friendly_name", entity_id),
+                                "state": entity.get("state", "unknown"),
+                                "domain": entity_id.split(".")[0] if "." in entity_id else ""
+                            }
+                    logger.info(f"Fetched details for {len(details)}/{len(entity_ids)} devices from HA")
+                else:
+                    logger.error(f"Failed to fetch from HA: status {resp.status}")
+    except Exception as e:
+        logger.error(f"Error fetching device details from HA: {e}")
+
+    return details
+
+
+def build_device_list_section(device_details: dict) -> str:
+    """Build the '### Available Devices' section content from device details."""
+    if not device_details:
+        return "### Available Devices\nNo devices configured. Use the Admin Panel to expose devices."
+
+    # Group devices by domain
+    by_domain = {}
+    for entity_id, info in device_details.items():
+        domain = info["domain"]
+        if domain not in by_domain:
+            by_domain[domain] = []
+        by_domain[domain].append((entity_id, info["friendly_name"]))
+
+    # Build section content
+    lines = ["### Available Devices"]
+
+    # Sort domains by priority (automations first, then lights, etc.)
+    domain_order = ["automation", "light", "switch", "button", "scene", "script",
+                    "lock", "cover", "fan", "climate", "media_player", "input_boolean"]
+    sorted_domains = sorted(by_domain.keys(),
+                           key=lambda d: domain_order.index(d) if d in domain_order else 999)
+
+    for domain in sorted_domains:
+        devices = by_domain[domain]
+        label = DOMAIN_LABELS.get(domain, domain.upper())
+        lines.append(f"{label}:")
+        for entity_id, friendly_name in sorted(devices, key=lambda x: x[1]):
+            lines.append(f"- {friendly_name}: {entity_id}")
+        lines.append("")  # Blank line between groups
+
+    return "\n".join(lines).strip()
+
+
+def load_system_prompt(device_section: str = None) -> str:
+    """Load system prompt and optionally inject dynamic device list."""
+    if not PROMPT_FILE.exists():
+        logger.warning(f"No prompt file at {PROMPT_FILE}, using default")
+        return "You are Sage, a helpful AI assistant."
+
+    prompt = PROMPT_FILE.read_text().strip()
+
+    # If we have a device section, replace the existing one
+    if device_section:
+        # Pattern to match the entire "### Available Devices" section until next "###" or "## " or end
+        pattern = r'### Available Devices.*?(?=###|## |\Z)'
+        if re.search(pattern, prompt, re.DOTALL):
+            prompt = re.sub(pattern, device_section + "\n\n", prompt, flags=re.DOTALL)
+            logger.info("Injected dynamic device list into system prompt")
+        else:
+            # No existing section, append before "### Rules" if it exists
+            rules_pattern = r'(### Rules)'
+            if re.search(rules_pattern, prompt):
+                prompt = re.sub(rules_pattern, device_section + "\n\n\\1", prompt)
+                logger.info("Added device list section before Rules")
+            else:
+                # Just append at end
+                prompt = prompt + "\n\n" + device_section
+                logger.info("Appended device list section to prompt")
+
+    logger.info(f"Loaded system prompt ({len(prompt)} chars)")
+    return prompt
+
 
 ALLOWED_SERVICES = {
     "light": ["turn_on", "turn_off", "toggle"],
@@ -108,13 +237,6 @@ PATTERN_CATCHALL = re.compile(
 VALID_DOMAINS = {'light', 'switch', 'automation', 'button', 'scene', 'script',
                  'lock', 'cover', 'fan', 'climate', 'media_player', 'input_boolean'}
 
-def load_system_prompt() -> str:
-    if PROMPT_FILE.exists():
-        prompt = PROMPT_FILE.read_text().strip()
-        logger.info(f"Loaded system prompt ({len(prompt)} chars)")
-        return prompt
-    logger.warning(f"No prompt file at {PROMPT_FILE}, using default")
-    return "You are Sage, a helpful AI assistant."
 
 def parse_params(params_str: str) -> dict:
     """Parse pipe-separated parameters like 'brightness_pct=50 | color_name=red'."""
@@ -260,8 +382,8 @@ async def execute_action(action: dict) -> bool:
         return False
 
 class SageAgent(Agent):
-    def __init__(self):
-        super().__init__(instructions=load_system_prompt())
+    def __init__(self, instructions: str):
+        super().__init__(instructions=instructions)
 
     async def tts_node(self, text: AsyncIterable, model_settings):
         # Collect all text chunks from the LLM
@@ -302,10 +424,18 @@ async def entrypoint(ctx: JobContext):
         logger.error("Configuration validation failed - check your .env file")
         return
 
+    # Load exposed devices and fetch their details from HA
+    exposed_ids = load_exposed_devices()
+    device_details = await fetch_device_details(exposed_ids)
+    device_section = build_device_list_section(device_details)
+
+    # Load system prompt with dynamic device list
+    system_prompt = load_system_prompt(device_section)
+
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     logger.info(f"Connected to room: {ctx.room.name}")
 
-    agent = SageAgent()
+    agent = SageAgent(instructions=system_prompt)
 
     ollama_llm = openai.LLM(
         model="deepseek-v3.2",
