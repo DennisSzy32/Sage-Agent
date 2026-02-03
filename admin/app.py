@@ -106,6 +106,58 @@ async def restart_service(service_name: str) -> dict:
         return {"success": False, "message": str(e)}
 
 
+async def get_git_info() -> dict:
+    """Get current git commit info."""
+    try:
+        # Get current commit hash (short)
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--short", "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=BASE_DIR
+        )
+        stdout, _ = await proc.communicate()
+        commit = stdout.decode().strip() if proc.returncode == 0 else "unknown"
+
+        # Get current branch
+        proc = await asyncio.create_subprocess_exec(
+            "git", "branch", "--show-current",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=BASE_DIR
+        )
+        stdout, _ = await proc.communicate()
+        branch = stdout.decode().strip() if proc.returncode == 0 else "unknown"
+
+        return {"commit": commit, "branch": branch}
+    except Exception as e:
+        return {"commit": "error", "branch": "error", "error": str(e)}
+
+
+async def git_pull() -> dict:
+    """Pull latest changes from git."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=BASE_DIR
+        )
+        stdout, stderr = await proc.communicate()
+        output = stdout.decode().strip()
+        error = stderr.decode().strip()
+
+        if proc.returncode == 0:
+            if "Already up to date" in output:
+                return {"success": True, "message": "Already up to date", "updated": False}
+            else:
+                return {"success": True, "message": output, "updated": True}
+        else:
+            return {"success": False, "message": error or output}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
 # Pydantic models for API
 class SystemPromptUpdate(BaseModel):
     content: str
@@ -391,6 +443,7 @@ async def dashboard(username: str = Depends(verify_credentials)):
     # Get service statuses
     agent_status = await get_service_status("sage-agent")
     admin_status = await get_service_status("sage-admin")
+    git_info = await get_git_info()
 
     agent_status_class = "status-ok" if agent_status["active"] else "status-error"
     admin_status_class = "status-ok" if admin_status["active"] else "status-error"
@@ -401,7 +454,7 @@ async def dashboard(username: str = Depends(verify_credentials)):
         <div id="message" class="message"></div>
         <div class="stats">
             <div class="stat-box">
-                <div class="value">4.5</div>
+                <div class="value">4.6</div>
                 <div class="label">Agent Version</div>
             </div>
             <div class="stat-box">
@@ -411,6 +464,17 @@ async def dashboard(username: str = Depends(verify_credentials)):
             <div class="stat-box">
                 <div class="value">{prompt_size:,}</div>
                 <div class="label">Prompt Size (bytes)</div>
+            </div>
+            <div class="stat-box">
+                <div class="value" style="font-size: 16px;">{git_info["commit"]}</div>
+                <div class="label">Git Commit ({git_info["branch"]})</div>
+            </div>
+        </div>
+        <div style="margin-top: 20px;">
+            <h3 style="margin-bottom: 10px; font-size: 14px; color: #555;">Deployment</h3>
+            <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
+                <button class="btn" onclick="pullUpdates()" style="background: #7b1fa2;">Pull Updates from GitHub</button>
+                <span id="pull-status" style="font-size: 13px; color: #666;"></span>
             </div>
         </div>
         <div style="margin-top: 20px;">
@@ -437,7 +501,7 @@ async def dashboard(username: str = Depends(verify_credentials)):
             <li><strong>Devices</strong> - Choose which Home Assistant devices Sage can control</li>
         </ul>
         <p style="color: #888; font-size: 13px;">
-            After making changes, click the <strong>Restart</strong> button next to sage-agent above to apply them.
+            <strong>Workflow:</strong> Pull Updates → Restart sage-admin (if admin changed) → Restart sage-agent (to apply config)
         </p>
     </div>
     <script>
@@ -480,6 +544,44 @@ async def dashboard(username: str = Depends(verify_credentials)):
                 messageEl.className = 'message error';
                 messageEl.style.background = '';
                 messageEl.style.border = '';
+            }}
+        }}
+
+        async function pullUpdates() {{
+            const messageEl = document.getElementById('message');
+            const pullStatus = document.getElementById('pull-status');
+
+            pullStatus.textContent = 'Pulling...';
+            messageEl.style.display = 'none';
+
+            try {{
+                const response = await fetch('/api/git/pull', {{ method: 'POST' }});
+                const data = await response.json();
+
+                if (data.success) {{
+                    pullStatus.textContent = '';
+                    if (data.updated) {{
+                        messageEl.textContent = 'Updates pulled successfully! Restart services to apply changes.';
+                        messageEl.className = 'message success';
+                        messageEl.style.display = 'block';
+                        // Reload to show new commit
+                        setTimeout(() => location.reload(), 2000);
+                    }} else {{
+                        messageEl.textContent = data.message;
+                        messageEl.className = 'message success';
+                        messageEl.style.display = 'block';
+                    }}
+                }} else {{
+                    pullStatus.textContent = '';
+                    messageEl.textContent = 'Pull failed: ' + data.message;
+                    messageEl.className = 'message error';
+                    messageEl.style.display = 'block';
+                }}
+            }} catch (e) {{
+                pullStatus.textContent = '';
+                messageEl.textContent = 'Error: ' + e.message;
+                messageEl.className = 'message error';
+                messageEl.style.display = 'block';
             }}
         }}
     </script>
@@ -863,7 +965,19 @@ async def service_restart(service_name: str, username: str = Depends(verify_cred
     return await restart_service(service_name)
 
 
+@app.get("/api/git/info")
+async def git_info_endpoint(username: str = Depends(verify_credentials)):
+    """Get current git info."""
+    return await get_git_info()
+
+
+@app.post("/api/git/pull")
+async def git_pull_endpoint(username: str = Depends(verify_credentials)):
+    """Pull latest changes from git."""
+    return await git_pull()
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint (no auth required)."""
-    return {"status": "ok", "version": "4.5"}
+    return {"status": "ok", "version": "4.6"}

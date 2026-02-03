@@ -1,5 +1,5 @@
 """
-Sage Voice Assistant Agent v4.5
+Sage Voice Assistant Agent v4.6
 Manual action parsing via tts_node interception
 Actions are parsed and executed BEFORE text reaches TTS
 - Multi-pattern regex for LLM output variations
