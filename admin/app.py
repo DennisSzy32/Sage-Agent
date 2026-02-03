@@ -5,6 +5,7 @@ FastAPI web interface for managing Sage voice assistant
 
 import os
 import json
+import asyncio
 import aiohttp
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -65,6 +66,44 @@ def load_exposed_devices() -> list:
 def save_exposed_devices(devices: list):
     """Save list of exposed device entity_ids."""
     EXPOSED_DEVICES_FILE.write_text(json.dumps(devices, indent=2))
+
+
+async def get_service_status(service_name: str) -> dict:
+    """Get the status of a systemd service."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", "is-active", service_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        is_active = stdout.decode().strip() == "active"
+
+        # Get more details if active
+        status = "running" if is_active else "stopped"
+
+        return {"service": service_name, "status": status, "active": is_active}
+    except Exception as e:
+        return {"service": service_name, "status": "unknown", "active": False, "error": str(e)}
+
+
+async def restart_service(service_name: str) -> dict:
+    """Restart a systemd service using sudo."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "systemctl", "restart", service_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode == 0:
+            return {"success": True, "message": f"{service_name} restarted successfully"}
+        else:
+            error = stderr.decode().strip()
+            return {"success": False, "message": f"Failed to restart: {error}"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
 # Pydantic models for API
@@ -349,12 +388,20 @@ async def dashboard(username: str = Depends(verify_credentials)):
     exposed_count = len(load_exposed_devices())
     prompt_size = PROMPT_FILE.stat().st_size if PROMPT_FILE.exists() else 0
 
+    # Get service statuses
+    agent_status = await get_service_status("sage-agent")
+    admin_status = await get_service_status("sage-admin")
+
+    agent_status_class = "status-ok" if agent_status["active"] else "status-error"
+    admin_status_class = "status-ok" if admin_status["active"] else "status-error"
+
     content = f"""
     <div class="card">
         <h2>Status Overview</h2>
+        <div id="message" class="message"></div>
         <div class="stats">
             <div class="stat-box">
-                <div class="value">4.4</div>
+                <div class="value">4.5</div>
                 <div class="label">Agent Version</div>
             </div>
             <div class="stat-box">
@@ -366,6 +413,21 @@ async def dashboard(username: str = Depends(verify_credentials)):
                 <div class="label">Prompt Size (bytes)</div>
             </div>
         </div>
+        <div style="margin-top: 20px;">
+            <h3 style="margin-bottom: 10px; font-size: 14px; color: #555;">Services</h3>
+            <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                <div style="display: flex; align-items: center; gap: 10px; padding: 10px 15px; background: #fafafa; border-radius: 6px; border: 1px solid #eee;">
+                    <span>sage-agent</span>
+                    <span class="status {agent_status_class}" id="agent-status">{agent_status["status"]}</span>
+                    <button class="btn" onclick="restartService('sage-agent')" style="padding: 5px 10px; font-size: 12px;">Restart</button>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px; padding: 10px 15px; background: #fafafa; border-radius: 6px; border: 1px solid #eee;">
+                    <span>sage-admin</span>
+                    <span class="status {admin_status_class}" id="admin-status">{admin_status["status"]}</span>
+                    <button class="btn btn-secondary" onclick="restartService('sage-admin')" style="padding: 5px 10px; font-size: 12px;">Restart</button>
+                </div>
+            </div>
+        </div>
     </div>
     <div class="card">
         <h2>Quick Actions</h2>
@@ -375,10 +437,52 @@ async def dashboard(username: str = Depends(verify_credentials)):
             <li><strong>Devices</strong> - Choose which Home Assistant devices Sage can control</li>
         </ul>
         <p style="color: #888; font-size: 13px;">
-            Note: After making changes, restart the sage-agent service for them to take effect:<br>
-            <code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px;">sudo systemctl restart sage-agent</code>
+            After making changes, click the <strong>Restart</strong> button next to sage-agent above to apply them.
         </p>
     </div>
+    <script>
+        async function restartService(serviceName) {{
+            const messageEl = document.getElementById('message');
+            messageEl.textContent = 'Restarting ' + serviceName + '...';
+            messageEl.className = 'message';
+            messageEl.style.display = 'block';
+            messageEl.style.background = '#fff3e0';
+            messageEl.style.color = '#e65100';
+            messageEl.style.border = '1px solid #ffcc80';
+
+            try {{
+                const response = await fetch('/api/service/' + serviceName + '/restart', {{
+                    method: 'POST'
+                }});
+                const data = await response.json();
+
+                if (data.success) {{
+                    messageEl.textContent = data.message;
+                    messageEl.className = 'message success';
+                    messageEl.style.background = '';
+                    messageEl.style.border = '';
+
+                    // Refresh status after a short delay
+                    if (serviceName !== 'sage-admin') {{
+                        setTimeout(() => location.reload(), 1500);
+                    }} else {{
+                        messageEl.textContent = data.message + ' Page will reload...';
+                        setTimeout(() => location.reload(), 3000);
+                    }}
+                }} else {{
+                    messageEl.textContent = 'Error: ' + data.message;
+                    messageEl.className = 'message error';
+                    messageEl.style.background = '';
+                    messageEl.style.border = '';
+                }}
+            }} catch (e) {{
+                messageEl.textContent = 'Error: ' + e.message;
+                messageEl.className = 'message error';
+                messageEl.style.background = '';
+                messageEl.style.border = '';
+            }}
+        }}
+    </script>
     """
     return HTMLResponse(get_base_html("dashboard", content))
 
@@ -401,13 +505,14 @@ async def prompt_page(username: str = Depends(verify_credentials)):
             Edit Sage's system prompt below. This defines the AI's personality, capabilities, and available devices.
         </p>
         <textarea id="prompt-editor">{prompt_content}</textarea>
-        <div style="margin-top: 15px; display: flex; gap: 10px;">
-            <button class="btn" onclick="savePrompt()">Save Changes</button>
+        <div style="margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
+            <button class="btn" onclick="savePrompt(false)">Save Changes</button>
+            <button class="btn" onclick="savePrompt(true)" style="background: #1976d2;">Save & Restart Agent</button>
             <button class="btn btn-secondary" onclick="reloadPrompt()">Reload</button>
         </div>
     </div>
     <script>
-        async function savePrompt() {{
+        async function savePrompt(restart) {{
             const content = document.getElementById('prompt-editor').value;
             const messageEl = document.getElementById('message');
 
@@ -419,18 +524,44 @@ async def prompt_page(username: str = Depends(verify_credentials)):
                 }});
 
                 if (response.ok) {{
-                    messageEl.textContent = 'System prompt saved successfully! Restart sage-agent to apply changes.';
-                    messageEl.className = 'message success';
+                    if (restart) {{
+                        messageEl.textContent = 'Saved! Restarting sage-agent...';
+                        messageEl.className = 'message';
+                        messageEl.style.display = 'block';
+                        messageEl.style.background = '#fff3e0';
+                        messageEl.style.color = '#e65100';
+                        messageEl.style.border = '1px solid #ffcc80';
+
+                        const restartResp = await fetch('/api/service/sage-agent/restart', {{ method: 'POST' }});
+                        const restartData = await restartResp.json();
+
+                        if (restartData.success) {{
+                            messageEl.textContent = 'System prompt saved and agent restarted successfully!';
+                            messageEl.className = 'message success';
+                            messageEl.style.background = '';
+                            messageEl.style.border = '';
+                        }} else {{
+                            messageEl.textContent = 'Saved, but restart failed: ' + restartData.message;
+                            messageEl.className = 'message error';
+                            messageEl.style.background = '';
+                            messageEl.style.border = '';
+                        }}
+                    }} else {{
+                        messageEl.textContent = 'System prompt saved successfully! Restart sage-agent to apply changes.';
+                        messageEl.className = 'message success';
+                        messageEl.style.display = 'block';
+                    }}
                 }} else {{
                     const data = await response.json();
                     messageEl.textContent = 'Error: ' + (data.detail || 'Failed to save');
                     messageEl.className = 'message error';
+                    messageEl.style.display = 'block';
                 }}
             }} catch (e) {{
                 messageEl.textContent = 'Error: ' + e.message;
                 messageEl.className = 'message error';
+                messageEl.style.display = 'block';
             }}
-            messageEl.style.display = 'block';
         }}
 
         function reloadPrompt() {{
@@ -456,7 +587,8 @@ async def devices_page(username: str = Depends(verify_credentials)):
             <div class="spacer"></div>
             <button class="btn btn-secondary" onclick="selectAll()">Select All</button>
             <button class="btn btn-secondary" onclick="selectNone()">Select None</button>
-            <button class="btn" onclick="saveDevices()">Save Selection</button>
+            <button class="btn" onclick="saveDevices(false)">Save Selection</button>
+            <button class="btn" onclick="saveDevices(true)" style="background: #1976d2;">Save & Restart Agent</button>
         </div>
         <div id="device-list">
             <div class="loading">Loading devices from Home Assistant...</div>
@@ -591,7 +723,7 @@ async def devices_page(username: str = Depends(verify_credentials)):
             renderDevices();
         }
 
-        async function saveDevices() {
+        async function saveDevices(restart) {
             const messageEl = document.getElementById('message');
             try {
                 const response = await fetch('/api/devices', {
@@ -601,18 +733,44 @@ async def devices_page(username: str = Depends(verify_credentials)):
                 });
 
                 if (response.ok) {
-                    messageEl.textContent = 'Device selection saved! Restart sage-agent to apply changes.';
-                    messageEl.className = 'message success';
+                    if (restart) {
+                        messageEl.textContent = 'Saved! Restarting sage-agent...';
+                        messageEl.className = 'message';
+                        messageEl.style.display = 'block';
+                        messageEl.style.background = '#fff3e0';
+                        messageEl.style.color = '#e65100';
+                        messageEl.style.border = '1px solid #ffcc80';
+
+                        const restartResp = await fetch('/api/service/sage-agent/restart', { method: 'POST' });
+                        const restartData = await restartResp.json();
+
+                        if (restartData.success) {
+                            messageEl.textContent = 'Device selection saved and agent restarted successfully!';
+                            messageEl.className = 'message success';
+                            messageEl.style.background = '';
+                            messageEl.style.border = '';
+                        } else {
+                            messageEl.textContent = 'Saved, but restart failed: ' + restartData.message;
+                            messageEl.className = 'message error';
+                            messageEl.style.background = '';
+                            messageEl.style.border = '';
+                        }
+                    } else {
+                        messageEl.textContent = 'Device selection saved! Restart sage-agent to apply changes.';
+                        messageEl.className = 'message success';
+                        messageEl.style.display = 'block';
+                    }
                 } else {
                     const data = await response.json();
                     messageEl.textContent = 'Error: ' + (data.detail || 'Failed to save');
                     messageEl.className = 'message error';
+                    messageEl.style.display = 'block';
                 }
             } catch (e) {
                 messageEl.textContent = 'Error: ' + e.message;
                 messageEl.className = 'message error';
+                messageEl.style.display = 'block';
             }
-            messageEl.style.display = 'block';
         }
 
         // Load on page load
@@ -689,7 +847,23 @@ async def save_devices(data: ExposedDevicesUpdate, username: str = Depends(verif
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/service/{service_name}/status")
+async def service_status(service_name: str, username: str = Depends(verify_credentials)):
+    """Get status of a service."""
+    if service_name not in ["sage-agent", "sage-admin"]:
+        raise HTTPException(status_code=400, detail="Invalid service name")
+    return await get_service_status(service_name)
+
+
+@app.post("/api/service/{service_name}/restart")
+async def service_restart(service_name: str, username: str = Depends(verify_credentials)):
+    """Restart a service."""
+    if service_name not in ["sage-agent", "sage-admin"]:
+        raise HTTPException(status_code=400, detail="Invalid service name")
+    return await restart_service(service_name)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint (no auth required)."""
-    return {"status": "ok", "version": "4.4"}
+    return {"status": "ok", "version": "4.5"}
