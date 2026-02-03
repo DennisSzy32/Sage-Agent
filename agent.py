@@ -1,7 +1,9 @@
 """
-Sage Voice Assistant Agent v4.2
+Sage Voice Assistant Agent v4.3
 Manual action parsing via tts_node interception
 Actions are parsed and executed BEFORE text reaches TTS
+- Multi-pattern regex for LLM output variations
+- Startup validation for required config
 """
 
 import os
@@ -24,7 +26,44 @@ logger = logging.getLogger("sage-agent")
 
 HA_URL = os.environ.get("HOME_ASSISTANT_URL", "http://homeassistant.local:8123")
 HA_TOKEN = os.environ.get("HOME_ASSISTANT_TOKEN", "")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 PROMPT_FILE = Path(__file__).parent / "system_prompt.txt"
+
+
+def validate_config() -> bool:
+    """Validate required configuration at startup. Returns True if valid."""
+    errors = []
+    warnings = []
+
+    # Required: LiveKit credentials
+    if not os.environ.get("LIVEKIT_URL"):
+        errors.append("LIVEKIT_URL is not set")
+    if not os.environ.get("LIVEKIT_API_KEY"):
+        errors.append("LIVEKIT_API_KEY is not set")
+    if not os.environ.get("LIVEKIT_API_SECRET"):
+        errors.append("LIVEKIT_API_SECRET is not set")
+
+    # Required: Ollama API key
+    if not OLLAMA_API_KEY:
+        errors.append("OLLAMA_API_KEY is not set")
+
+    # Optional but recommended: Home Assistant
+    if not HA_TOKEN:
+        warnings.append("HOME_ASSISTANT_TOKEN is not set - smart home control will not work")
+
+    # Log warnings
+    for warning in warnings:
+        logger.warning(f"CONFIG WARNING: {warning}")
+
+    # Log errors and return result
+    if errors:
+        for error in errors:
+            logger.error(f"CONFIG ERROR: {error}")
+        return False
+
+    logger.info("Configuration validated successfully")
+    return True
 
 ALLOWED_SERVICES = {
     "light": ["turn_on", "turn_off", "toggle"],
@@ -41,11 +80,33 @@ ALLOWED_SERVICES = {
     "input_boolean": ["turn_on", "turn_off", "toggle"],
 }
 
-# THIS REGEX IS TOO STRICT - only matches exact [ACTION: format
-ACTION_PATTERN = re.compile(
-    r'\[ACTION:\s*([a-z_]+\.[a-z_]+)\s*\|\s*entity_id=([a-z0-9_.]+)(?:\s*\|\s*([^\]]+))?\]',
+# Multiple patterns to catch LLM output variations
+# Pattern 1: Intended format [ACTION: domain.service | entity_id=xxx]
+PATTERN_ACTION = re.compile(
+    r'\[ACTION:\s*([a-z_]+)\.([a-z_]+)\s*\|\s*entity_id=([a-z0-9_.]+)(?:\s*\|\s*([^\]]+))?\]',
     re.IGNORECASE
 )
+
+# Pattern 2: LLM variation [domain:service] entity_id=xxx
+PATTERN_COLON = re.compile(
+    r'\[([a-z_]+):([a-z_]+)\]\s*entity_id=([a-z0-9_.]+)',
+    re.IGNORECASE
+)
+
+# Pattern 3: Without ACTION prefix [domain.service | entity_id=xxx]
+PATTERN_SIMPLE = re.compile(
+    r'\[([a-z_]+)\.([a-z_]+)\s*\|\s*entity_id=([a-z0-9_.]+)(?:\s*\|\s*([^\]]+))?\]',
+    re.IGNORECASE
+)
+
+# Pattern 4: Catch-all for any bracketed command with entity_id nearby
+PATTERN_CATCHALL = re.compile(
+    r'\[([a-z_]+)[:\.]([a-z_]+)\][^\[]*?entity_id[=:\s]+([a-z0-9_.]+)',
+    re.IGNORECASE
+)
+
+VALID_DOMAINS = {'light', 'switch', 'automation', 'button', 'scene', 'script',
+                 'lock', 'cover', 'fan', 'climate', 'media_player', 'input_boolean'}
 
 def load_system_prompt() -> str:
     if PROMPT_FILE.exists():
@@ -55,37 +116,117 @@ def load_system_prompt() -> str:
     logger.warning(f"No prompt file at {PROMPT_FILE}, using default")
     return "You are Sage, a helpful AI assistant."
 
+def parse_params(params_str: str) -> dict:
+    """Parse pipe-separated parameters like 'brightness_pct=50 | color_name=red'."""
+    data = {}
+    if not params_str:
+        return data
+    for param in params_str.split("|"):
+        param = param.strip()
+        if "=" in param:
+            key, value = param.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if value.isdigit():
+                value = int(value)
+            elif value.replace(".", "", 1).isdigit():
+                value = float(value)
+            data[key] = value
+    return data
+
 def parse_actions(text: str) -> list:
+    """Parse action tags from text using multiple patterns to catch LLM variations."""
     actions = []
-    for match in ACTION_PATTERN.finditer(text):
-        service_full = match.group(1)
-        entity_id = match.group(2)
-        params_str = match.group(3)
-        parts = service_full.split(".")
-        if len(parts) != 2:
-            logger.warning(f"Invalid service format: {service_full}")
-            continue
-        domain, service = parts
-        data = {}
-        if params_str:
-            for param in params_str.split("|"):
-                param = param.strip()
-                if "=" in param:
-                    key, value = param.split("=", 1)
-                    key, value = key.strip(), value.strip()
-                    if value.isdigit():
-                        value = int(value)
-                    elif value.replace(".", "", 1).isdigit():
-                        value = float(value)
-                    data[key] = value
-        actions.append({"domain": domain, "service": service, "entity_id": entity_id, "data": data})
+    seen = set()  # Avoid duplicate actions
+
+    # Pattern 1: [ACTION: domain.service | entity_id=xxx | params]
+    for match in PATTERN_ACTION.finditer(text):
+        domain, service, entity_id, params_str = match.groups()
+        key = (domain.lower(), service.lower(), entity_id.lower())
+        if key not in seen and domain.lower() in VALID_DOMAINS:
+            seen.add(key)
+            actions.append({
+                "domain": domain.lower(),
+                "service": service.lower(),
+                "entity_id": entity_id,
+                "data": parse_params(params_str)
+            })
+            logger.debug(f"Pattern ACTION matched: {domain}.{service} -> {entity_id}")
+
+    # Pattern 2: [domain:service] entity_id=xxx
+    for match in PATTERN_COLON.finditer(text):
+        domain, service, entity_id = match.groups()
+        key = (domain.lower(), service.lower(), entity_id.lower())
+        if key not in seen and domain.lower() in VALID_DOMAINS:
+            seen.add(key)
+            actions.append({
+                "domain": domain.lower(),
+                "service": service.lower(),
+                "entity_id": entity_id,
+                "data": {}
+            })
+            logger.debug(f"Pattern COLON matched: {domain}.{service} -> {entity_id}")
+
+    # Pattern 3: [domain.service | entity_id=xxx | params]
+    for match in PATTERN_SIMPLE.finditer(text):
+        domain, service, entity_id, params_str = match.groups()
+        key = (domain.lower(), service.lower(), entity_id.lower())
+        if key not in seen and domain.lower() in VALID_DOMAINS:
+            seen.add(key)
+            actions.append({
+                "domain": domain.lower(),
+                "service": service.lower(),
+                "entity_id": entity_id,
+                "data": parse_params(params_str)
+            })
+            logger.debug(f"Pattern SIMPLE matched: {domain}.{service} -> {entity_id}")
+
+    # Pattern 4: Catch-all for malformed tags
+    for match in PATTERN_CATCHALL.finditer(text):
+        domain, service, entity_id = match.groups()
+        key = (domain.lower(), service.lower(), entity_id.lower())
+        if key not in seen and domain.lower() in VALID_DOMAINS:
+            seen.add(key)
+            actions.append({
+                "domain": domain.lower(),
+                "service": service.lower(),
+                "entity_id": entity_id,
+                "data": {}
+            })
+            logger.debug(f"Pattern CATCHALL matched: {domain}.{service} -> {entity_id}")
+
     return actions
 
 def clean_for_tts(text: str) -> str:
-    cleaned = ACTION_PATTERN.sub("", text)
+    """Remove all action tag variations and technical artifacts from text before TTS."""
+    cleaned = text
+
+    # Remove Pattern 1: [ACTION: domain.service | entity_id=xxx | params]
+    cleaned = PATTERN_ACTION.sub("", cleaned)
+
+    # Remove Pattern 2: [domain:service] entity_id=xxx (both parts)
+    cleaned = re.sub(r'\[([a-z_]+):([a-z_]+)\]\s*entity_id=[a-z0-9_.]+', '', cleaned, flags=re.IGNORECASE)
+
+    # Remove Pattern 3: [domain.service | entity_id=xxx | params]
+    cleaned = PATTERN_SIMPLE.sub("", cleaned)
+
+    # Remove any remaining bracketed domain commands
+    cleaned = re.sub(r'\[([a-z_]+)[:\.]([a-z_]+)\]', '', cleaned, flags=re.IGNORECASE)
+
+    # Remove standalone entity_id references
+    cleaned = re.sub(r'\bentity_id\s*[=:]\s*[a-z0-9_.]+', '', cleaned, flags=re.IGNORECASE)
+
+    # Remove <tools> blocks
     cleaned = re.sub(r'<tools>.*?</tools>', '', cleaned, flags=re.DOTALL)
+
+    # Remove bare domain.entity_id references (like "scene.tv" or "automation.watch_tv_lighting")
     cleaned = re.sub(r'\b(light|switch|automation|button|scene|script|lock|cover|fan|climate|media_player|input_boolean)\.[a-z0-9_]+\b', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+    # Clean up extra whitespace and punctuation artifacts
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = re.sub(r'\s+([.,!?])', r'\1', cleaned)  # Fix space before punctuation
+    cleaned = re.sub(r'([.,!?])\s*\1+', r'\1', cleaned)  # Fix repeated punctuation
+    cleaned = cleaned.strip()
+
     return cleaned
 
 async def execute_action(action: dict) -> bool:
@@ -155,15 +296,21 @@ class SageAgent(Agent):
 
 async def entrypoint(ctx: JobContext):
     logger.info("Sage agent starting...")
+
+    # Validate configuration before proceeding
+    if not validate_config():
+        logger.error("Configuration validation failed - check your .env file")
+        return
+
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     logger.info(f"Connected to room: {ctx.room.name}")
-    
+
     agent = SageAgent()
-    
+
     ollama_llm = openai.LLM(
         model="deepseek-v3.2",
-        base_url="https://ollama.com/v1",
-        api_key=os.environ.get("OLLAMA_API_KEY"),
+        base_url=OLLAMA_BASE_URL,
+        api_key=OLLAMA_API_KEY,
     )
     
     session = AgentSession(
