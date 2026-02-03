@@ -1,10 +1,11 @@
 """
-Sage Voice Assistant Agent v4.6
-Manual action parsing via tts_node interception
+Sage Voice Assistant Agent v4.7
+Manual action parsing via llm_node interception
 Actions are parsed and executed BEFORE text reaches TTS
 - Multi-pattern regex for LLM output variations
 - Startup validation for required config
 - Dynamic device loading from exposed_devices.json
+- Fixed: Intercept at llm_node instead of tts_node to prevent parallel TTS path bypass
 """
 
 import os
@@ -18,7 +19,7 @@ from typing import AsyncIterable
 from dotenv import load_dotenv
 
 from livekit.agents import (
-    Agent, AgentSession, AutoSubscribe, JobContext, WorkerOptions, cli, room_io,
+    Agent, AgentSession, AutoSubscribe, JobContext, WorkerOptions, cli, room_io, llm,
 )
 from livekit.plugins import silero, openai
 
@@ -385,36 +386,69 @@ class SageAgent(Agent):
     def __init__(self, instructions: str):
         super().__init__(instructions=instructions)
 
-    async def tts_node(self, text: AsyncIterable, model_settings):
-        # Collect all text chunks from the LLM
-        chunks = []
-        async for chunk in text:
-            chunks.append(str(chunk) if not isinstance(chunk, str) else chunk)
-        full_text = "".join(chunks)
-        logger.debug(f"TTS Node received: {full_text[:100]}...")
-        
-        # Parse and execute any actions found
-        actions = parse_actions(full_text)
-        if actions:
-            logger.info(f"TTS Node: Found {len(actions)} action(s) to execute")
-            for action in actions:
-                logger.info(f"  -> {action['domain']}.{action['service']} | {action['entity_id']}")
-                asyncio.create_task(execute_action(action))
-        
-        # Clean the text (remove action tags)
-        cleaned_text = clean_for_tts(full_text)
-        if not cleaned_text:
-            logger.debug("TTS Node: No text to speak after cleaning")
-            return
-        logger.debug(f"TTS Node: Speaking: {cleaned_text[:50]}...")
-        
-        # Create async generator for cleaned text
-        async def cleaned_generator():
-            yield cleaned_text
-        
-        # Pass cleaned text to the default TTS node
-        async for frame in Agent.default.tts_node(self, cleaned_generator(), model_settings):
-            yield frame
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: list,
+        model_settings,
+    ):
+        """
+        Override llm_node to intercept LLM output, parse action tags,
+        execute Home Assistant commands, and clean text before TTS.
+
+        This is the correct interception point because it modifies the text
+        stream BEFORE it reaches the TTS pipeline, avoiding race conditions
+        with parallel audio synthesis.
+        """
+        # Get the default LLM response stream
+        llm_stream = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+
+        # Handle if llm_stream is a coroutine (needs await)
+        if asyncio.iscoroutine(llm_stream):
+            llm_stream = await llm_stream
+
+        # Buffer to accumulate text for action parsing
+        text_buffer = []
+
+        async for chunk in llm_stream:
+            # Handle string chunks directly
+            if isinstance(chunk, str):
+                text_buffer.append(chunk)
+                # We'll process and yield cleaned text at the end
+                continue
+
+            # Handle ChatChunk objects (structured LLM responses)
+            if hasattr(chunk, 'delta') and hasattr(chunk.delta, 'content'):
+                content = chunk.delta.content
+                if content:
+                    text_buffer.append(content)
+                    # Continue buffering - we process at the end
+                    continue
+
+            # For any other chunk types, yield as-is
+            yield chunk
+
+        # Now we have the complete text - parse and clean it
+        full_text = "".join(text_buffer)
+
+        if full_text:
+            logger.info(f"LLM Node INPUT: {full_text[:200]}...")
+
+            # Parse and execute any actions found
+            actions = parse_actions(full_text)
+            if actions:
+                logger.info(f"LLM Node: Found {len(actions)} action(s) to execute")
+                for action in actions:
+                    logger.info(f"  -> {action['domain']}.{action['service']} | {action['entity_id']}")
+                    asyncio.create_task(execute_action(action))
+
+            # Clean the text (remove action tags)
+            cleaned_text = clean_for_tts(full_text)
+            logger.info(f"LLM Node CLEANED: {cleaned_text[:200]}...")
+
+            if cleaned_text:
+                # Yield the cleaned text as a single string
+                yield cleaned_text
 
 async def entrypoint(ctx: JobContext):
     logger.info("Sage agent starting...")
