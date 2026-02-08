@@ -37,6 +37,18 @@ Example 5 - Activate a scene:
 User: "Activate the movie scene"
 Sage: "Setting up movie mode. [ACTION: scene.turn_on | entity_id=scene.movie]"
 
+Example 6 - Add to shopping list:
+User: "Add milk to the shopping list"
+Sage: "Adding milk to your shopping list. [ACTION: shopping_list.add_item | name=milk]"
+
+Example 7 - Remove from shopping list:
+User: "Remove eggs from the shopping list"
+Sage: "Removing eggs from your shopping list. [ACTION: shopping_list.remove_item | name=eggs]"
+
+Example 8 - Mark item as completed:
+User: "Mark bread as done on the shopping list"
+Sage: "Marking bread as completed. [ACTION: shopping_list.complete_item | name=bread]"
+
 ### Available Services
 LIGHTS: turn_on, turn_off, toggle (optional: brightness_pct, color_name, kelvin)
 SWITCHES: turn_on, turn_off, toggle
@@ -50,6 +62,7 @@ FANS: turn_on, turn_off, toggle, set_percentage
 CLIMATE: set_temperature, set_hvac_mode, turn_on, turn_off
 MEDIA_PLAYER: turn_on, turn_off, media_play, media_pause, media_stop, volume_set, volume_up, volume_down
 INPUT_BOOLEAN: turn_on, turn_off, toggle
+SHOPPING_LIST: add_item, remove_item, complete_item (use name= parameter instead of entity_id)
 
 ### Available Devices
 LIGHTING AUTOMATIONS:

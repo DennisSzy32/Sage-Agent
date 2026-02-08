@@ -208,6 +208,7 @@ ALLOWED_SERVICES = {
     "climate": ["set_temperature", "set_hvac_mode", "turn_on", "turn_off"],
     "media_player": ["turn_on", "turn_off", "media_play", "media_pause", "media_stop", "volume_set", "volume_up", "volume_down"],
     "input_boolean": ["turn_on", "turn_off", "toggle"],
+    "shopping_list": ["add_item", "remove_item", "complete_item"],
 }
 
 # Multiple patterns to catch LLM output variations
@@ -235,8 +236,16 @@ PATTERN_CATCHALL = re.compile(
     re.IGNORECASE
 )
 
+# Pattern 5: Generic ACTION without entity_id (e.g. shopping_list)
+# Matches [ACTION: domain.service | key=value | key=value]
+PATTERN_ACTION_GENERIC = re.compile(
+    r'\[ACTION:\s*([a-z_]+)\.([a-z_]+)\s*\|\s*([^\]]+)\]',
+    re.IGNORECASE
+)
+
 VALID_DOMAINS = {'light', 'switch', 'automation', 'button', 'scene', 'script',
-                 'lock', 'cover', 'fan', 'climate', 'media_player', 'input_boolean'}
+                 'lock', 'cover', 'fan', 'climate', 'media_player', 'input_boolean',
+                 'shopping_list'}
 
 
 def parse_params(params_str: str) -> dict:
@@ -317,6 +326,28 @@ def parse_actions(text: str) -> list:
             })
             logger.debug(f"Pattern CATCHALL matched: {domain}.{service} -> {entity_id}")
 
+    # Pattern 5: Generic ACTION (for services without entity_id, e.g. shopping_list)
+    for match in PATTERN_ACTION_GENERIC.finditer(text):
+        domain, service, params_str = match.groups()
+        params = parse_params(params_str)
+        # Skip if this was already matched by Pattern 1 (which also matches this format)
+        entity_id = params.pop("entity_id", None)
+        if entity_id:
+            key = (domain.lower(), service.lower(), entity_id.lower())
+        else:
+            # Use a key based on all params for dedup (e.g. shopping_list items)
+            key = (domain.lower(), service.lower(), str(sorted(params.items())))
+        if key not in seen and domain.lower() in VALID_DOMAINS:
+            seen.add(key)
+            action = {
+                "domain": domain.lower(),
+                "service": service.lower(),
+                "entity_id": entity_id,
+                "data": params
+            }
+            actions.append(action)
+            logger.debug(f"Pattern GENERIC matched: {domain}.{service} with params {params}")
+
     return actions
 
 def clean_for_tts(text: str) -> str:
@@ -325,6 +356,9 @@ def clean_for_tts(text: str) -> str:
 
     # Remove Pattern 1: [ACTION: domain.service | entity_id=xxx | params]
     cleaned = PATTERN_ACTION.sub("", cleaned)
+
+    # Remove Pattern 5: [ACTION: domain.service | key=value] (generic, e.g. shopping_list)
+    cleaned = PATTERN_ACTION_GENERIC.sub("", cleaned)
 
     # Remove Pattern 2: [domain:service] entity_id=xxx (both parts)
     cleaned = re.sub(r'\[([a-z_]+):([a-z_]+)\]\s*entity_id=[a-z0-9_.]+', '', cleaned, flags=re.IGNORECASE)
@@ -342,7 +376,7 @@ def clean_for_tts(text: str) -> str:
     cleaned = re.sub(r'<tools>.*?</tools>', '', cleaned, flags=re.DOTALL)
 
     # Remove bare domain.entity_id references (like "scene.tv" or "automation.watch_tv_lighting")
-    cleaned = re.sub(r'\b(light|switch|automation|button|scene|script|lock|cover|fan|climate|media_player|input_boolean)\.[a-z0-9_]+\b', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\b(light|switch|automation|button|scene|script|lock|cover|fan|climate|media_player|input_boolean|shopping_list)\.[a-z0-9_]+\b', '', cleaned, flags=re.IGNORECASE)
 
     # Clean up extra whitespace and punctuation artifacts
     cleaned = re.sub(r'\s+', ' ', cleaned)
@@ -355,7 +389,7 @@ def clean_for_tts(text: str) -> str:
 async def execute_action(action: dict) -> bool:
     domain = action["domain"]
     service = action["service"]
-    entity_id = action["entity_id"]
+    entity_id = action.get("entity_id")
     data = action.get("data", {})
     if domain not in ALLOWED_SERVICES:
         logger.warning(f"Domain not allowed: {domain}")
@@ -365,9 +399,11 @@ async def execute_action(action: dict) -> bool:
         return False
     url = f"{HA_URL}/api/services/{domain}/{service}"
     headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
-    payload = {"entity_id": entity_id}
+    payload = {}
+    if entity_id:
+        payload["entity_id"] = entity_id
     payload.update(data)
-    logger.info(f"Executing: {domain}.{service} -> {entity_id} with {data}")
+    logger.info(f"Executing: {domain}.{service} -> {entity_id or 'no entity'} with {data}")
     try:
         async with aiohttp.ClientSession() as http_session:
             async with http_session.post(url, headers=headers, json=payload) as resp:
