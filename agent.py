@@ -33,6 +33,7 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 PROMPT_FILE = Path(__file__).parent / "system_prompt.txt"
 EXPOSED_DEVICES_FILE = Path(__file__).parent / "exposed_devices.json"
+DEVICE_DESCRIPTIONS_FILE = Path(__file__).parent / "device_descriptions.json"
 
 # Domain labels for prompt generation
 DOMAIN_LABELS = {
@@ -100,6 +101,20 @@ def load_exposed_devices() -> list:
     return []
 
 
+def load_device_descriptions() -> dict:
+    """Load device descriptions from config file."""
+    if DEVICE_DESCRIPTIONS_FILE.exists():
+        try:
+            descriptions = json.loads(DEVICE_DESCRIPTIONS_FILE.read_text())
+            logger.info(f"Loaded descriptions for {len(descriptions)} devices")
+            return descriptions
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse device_descriptions.json: {e}")
+            return {}
+    logger.info("No device_descriptions.json found, using empty descriptions")
+    return {}
+
+
 async def fetch_device_details(entity_ids: list) -> dict:
     """Fetch device details from Home Assistant for the given entity_ids.
 
@@ -132,10 +147,17 @@ async def fetch_device_details(entity_ids: list) -> dict:
     return details
 
 
-def build_device_list_section(device_details: dict) -> str:
-    """Build the '### Available Devices' section content from device details."""
+def build_device_list_section(device_details: dict, descriptions: dict = None) -> str:
+    """Build the '### Available Devices' section content from device details.
+
+    Args:
+        device_details: Dict mapping entity_id to {friendly_name, state, domain}
+        descriptions: Optional dict mapping entity_id to description strings
+    """
     if not device_details:
         return "### Available Devices\nNo devices configured. Use the Admin Panel to expose devices."
+
+    descriptions = descriptions or {}
 
     # Group devices by domain
     by_domain = {}
@@ -143,7 +165,7 @@ def build_device_list_section(device_details: dict) -> str:
         domain = info["domain"]
         if domain not in by_domain:
             by_domain[domain] = []
-        by_domain[domain].append((entity_id, info["friendly_name"]))
+        by_domain[domain].append((entity_id, info["friendly_name"], info.get("state", "unknown")))
 
     # Build section content
     lines = ["### Available Devices"]
@@ -158,8 +180,12 @@ def build_device_list_section(device_details: dict) -> str:
         devices = by_domain[domain]
         label = DOMAIN_LABELS.get(domain, domain.upper())
         lines.append(f"{label}:")
-        for entity_id, friendly_name in sorted(devices, key=lambda x: x[1]):
-            lines.append(f"- {friendly_name}: {entity_id}")
+        for entity_id, friendly_name, state in sorted(devices, key=lambda x: x[1]):
+            line = f"- {friendly_name}: {entity_id} (state: {state})"
+            desc = descriptions.get(entity_id)
+            if desc:
+                line += f" — {desc}"
+            lines.append(line)
         lines.append("")  # Blank line between groups
 
     return "\n".join(lines).strip()
@@ -494,10 +520,11 @@ async def entrypoint(ctx: JobContext):
         logger.error("Configuration validation failed - check your .env file")
         return
 
-    # Load exposed devices and fetch their details from HA
+    # Load exposed devices, descriptions, and fetch their details from HA
     exposed_ids = load_exposed_devices()
+    descriptions = load_device_descriptions()
     device_details = await fetch_device_details(exposed_ids)
-    device_section = build_device_list_section(device_details)
+    device_section = build_device_list_section(device_details, descriptions)
 
     # Load system prompt with dynamic device list
     system_prompt = load_system_prompt(device_section)

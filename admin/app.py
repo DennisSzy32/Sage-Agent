@@ -23,6 +23,7 @@ ADMIN_PASS = os.environ.get("SAGE_ADMIN_PASS", "changeme")
 BASE_DIR = Path(__file__).parent.parent
 PROMPT_FILE = BASE_DIR / "system_prompt.txt"
 EXPOSED_DEVICES_FILE = BASE_DIR / "exposed_devices.json"
+DEVICE_DESCRIPTIONS_FILE = BASE_DIR / "device_descriptions.json"
 HA_URL = os.environ.get("HOME_ASSISTANT_URL", "http://homeassistant.local:8123")
 HA_TOKEN = os.environ.get("HOME_ASSISTANT_TOKEN", "")
 
@@ -66,6 +67,21 @@ def load_exposed_devices() -> list:
 def save_exposed_devices(devices: list):
     """Save list of exposed device entity_ids."""
     EXPOSED_DEVICES_FILE.write_text(json.dumps(devices, indent=2))
+
+
+def load_device_descriptions() -> dict:
+    """Load device descriptions mapping entity_id -> description."""
+    if DEVICE_DESCRIPTIONS_FILE.exists():
+        try:
+            return json.loads(DEVICE_DESCRIPTIONS_FILE.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_device_descriptions(descriptions: dict):
+    """Save device descriptions mapping."""
+    DEVICE_DESCRIPTIONS_FILE.write_text(json.dumps(descriptions, indent=2))
 
 
 async def get_service_status(service_name: str) -> dict:
@@ -165,6 +181,7 @@ class SystemPromptUpdate(BaseModel):
 
 class ExposedDevicesUpdate(BaseModel):
     devices: list[str]
+    descriptions: dict[str, str] = {}
 
 
 # HTML Templates
@@ -699,6 +716,7 @@ async def devices_page(username: str = Depends(verify_credentials)):
     <script>
         let allDevices = [];
         let exposedDevices = [];
+        let deviceDescriptions = {};
 
         async function loadDevices() {
             try {
@@ -706,6 +724,7 @@ async def devices_page(username: str = Depends(verify_credentials)):
                 const data = await response.json();
                 allDevices = data.devices || [];
                 exposedDevices = data.exposed || [];
+                deviceDescriptions = data.descriptions || {};
                 renderDevices();
             } catch (e) {
                 document.getElementById('device-list').innerHTML =
@@ -767,14 +786,17 @@ async def devices_page(username: str = Depends(verify_credentials)):
 
                 devices.forEach(device => {
                     const checked = exposedDevices.includes(device.entity_id) ? 'checked' : '';
+                    const isExposed = exposedDevices.includes(device.entity_id);
                     const name = device.friendly_name || device.entity_id;
-                    html += `<div class="device-item">
+                    const desc = deviceDescriptions[device.entity_id] || '';
+                    html += `<div class="device-item" style="flex-wrap: wrap;">
                         <input type="checkbox" id="${device.entity_id}" ${checked} onchange="toggleDevice('${device.entity_id}')">
                         <label for="${device.entity_id}">
                             ${name}<br>
                             <span class="entity-id">${device.entity_id}</span>
                         </label>
                         <span class="state">${device.state}</span>
+                        ${isExposed ? `<input type="text" class="desc-input" placeholder="Description (e.g. what this device does)..." value="${desc.replace(/"/g, '&quot;')}" onchange="updateDescription('${device.entity_id}', this.value)" style="width: 100%; margin-top: 6px; padding: 5px 8px; font-size: 12px; border: 1px solid #ddd; border-radius: 3px; color: #555;">` : ''}
                     </div>`;
                 });
 
@@ -825,13 +847,17 @@ async def devices_page(username: str = Depends(verify_credentials)):
             renderDevices();
         }
 
+        function updateDescription(entityId, value) {
+            deviceDescriptions[entityId] = value;
+        }
+
         async function saveDevices(restart) {
             const messageEl = document.getElementById('message');
             try {
                 const response = await fetch('/api/devices', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ devices: exposedDevices })
+                    body: JSON.stringify({ devices: exposedDevices, descriptions: deviceDescriptions })
                 });
 
                 if (response.ok) {
@@ -935,15 +961,20 @@ async def get_devices(username: str = Depends(verify_credentials)):
 
     return {
         "devices": devices,
-        "exposed": load_exposed_devices()
+        "exposed": load_exposed_devices(),
+        "descriptions": load_device_descriptions()
     }
 
 
 @app.post("/api/devices")
 async def save_devices(data: ExposedDevicesUpdate, username: str = Depends(verify_credentials)):
-    """Save the exposed devices list."""
+    """Save the exposed devices list and descriptions."""
     try:
         save_exposed_devices(data.devices)
+        if data.descriptions:
+            # Only save descriptions for devices that are exposed
+            filtered = {k: v for k, v in data.descriptions.items() if k in data.devices and v.strip()}
+            save_device_descriptions(filtered)
         return {"status": "ok", "count": len(data.devices)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
